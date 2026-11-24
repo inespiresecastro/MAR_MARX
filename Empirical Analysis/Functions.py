@@ -35,25 +35,25 @@ def student_t_pdf(e, nu, sigma):
 # RANDOM INITIALIZATION RULES
 # =========================================================
 
-def random_init(param_name):
+def random_init(param_name, rng, scale):
 
     name = param_name.lower()
 
     if "phi" in name or "psi" in name:
-        return np.random.uniform(-0.5, 0.5)
+        return rng.uniform(-.85, .85)
 
     elif "beta" in name or name.startswith("beta"):
-        return np.random.uniform(-1, 1)
+        return rng.normal(0, .1)
 
-    elif "sigma" in name:
-        return np.random.uniform(0.1, 2.0)
+    elif name == "sigma":
+        return scale * rng.uniform(.5, 2.)
 
-    elif "nu" in name:
-        return np.random.uniform(3.0, 10.0)
+    elif name == "nu":
+        return rng.choice([.8, 1., 1.8, 3., 6., 10.])
 
     else:
-        # fallback
-        return np.random.uniform(-1, 1)
+        return rng.uniform(-1, 1)
+
 
 
 
@@ -332,6 +332,7 @@ def _print_mle_diagnostics(
 # MULTISTART MLE
 # =========================================================
 
+
 def run_multistart(
     neg_loglik,
     param_names,
@@ -340,7 +341,10 @@ def run_multistart(
     X=None,
     n_starts=40,
     method="L-BFGS-B",
+    seed=42
 ):
+
+    rng = np.random.default_rng(seed)
 
     best_success = None
     best_fun_success = np.inf
@@ -351,67 +355,141 @@ def run_multistart(
     all_results = []
 
     # ---------------------------------------------
+    # DATA-DEPENDENT SCALE
+    # ---------------------------------------------
+
+    scale = max(
+        np.median(np.abs(np.diff(y))),
+        .05
+    )
+
+    # ---------------------------------------------
+    # FIXED INITIAL VALUES
+    # ---------------------------------------------
+
+    defaults = {
+        "phi": .4,
+        "psi": .5,
+        "sigma": scale,
+        "nu": 5.
+    }
+
+    theta_fixed = np.array([
+        defaults[name.lower()]
+        if name.lower() in defaults
+        else 0.
+        for name in param_names
+    ], dtype=float)
+
+    if len(bounds) != len(param_names):
+        raise ValueError(
+            "Number of bounds must match number of parameters."
+        )
+
+    # Check fixed initial values against bounds
+    for value, (lower, upper) in zip(theta_fixed, bounds):
+
+        if lower is not None and value < lower:
+            raise ValueError("Fixed initial value below lower bound.")
+
+        if upper is not None and value > upper:
+            raise ValueError("Fixed initial value above upper bound.")
+
+    # ---------------------------------------------
+    # LIKELIHOOD ARGUMENTS
+    # ---------------------------------------------
+
+    if X is None:
+        args = (y,)
+    else:
+        args = (y, X)
+
+    # ---------------------------------------------
     # MULTISTART OPTIMIZATION
     # ---------------------------------------------
 
-    for _ in range(n_starts):
+    for start in range(n_starts):
 
-        # automatic initialization
-        theta0 = np.array([
-            random_init(name)
-            for name in param_names
-        ])
+        # First start: fixed initial values
+        if start == 0:
+            theta0 = theta_fixed.copy()
 
-        # models with or without X
-        if X is None:
-            args = (y,)
+        # Remaining starts: random initialization
         else:
-            args = (y, X)
+            theta0 = np.array([
+                random_init(name, rng, scale)
+                for name in param_names
+            ])
 
-        result = minimize(
-            neg_loglik,
-            theta0,
-            args=args,
-            method=method,
-            bounds=bounds,
-            options={
-            "maxiter": 10000,
-            "maxfun": 100000,
-            "ftol": 1e-15,
-            "gtol": 1e-10,
-            "maxls": 100,
-            }
-        )
+        # Check random initial values against bounds
+        for j, (lower, upper) in enumerate(bounds):
 
-        #print(result.message)
-        #print(result.nit)
-        #print(result.nfev)
-        #print(result.fun)
+            if lower is not None:
+                theta0[j] = max(theta0[j], lower)
+
+            if upper is not None:
+                theta0[j] = min(theta0[j], upper)
+
+        try:
+            result = minimize(
+                neg_loglik,
+                theta0,
+                args=args,
+                method=method,
+                bounds=bounds,
+                options={
+                    "maxiter": 5000,
+                    "ftol": 1e-11,
+                    "gtol": 1e-8,
+                    "maxls": 50
+                }
+            )
+
+        except (
+            ValueError,
+            FloatingPointError,
+            OverflowError
+        ):
+            continue
 
         all_results.append(result)
 
         fun = result.fun
-        if not np.isfinite(fun):
+
+        if not np.isfinite(fun) or fun >= 1e90:
             continue
 
+        # Best finite result
         if fun < best_fun_any:
             best_fun_any = fun
             best_any = result
 
+        # Best successful result
         if result.success and fun < best_fun_success:
             best_fun_success = fun
             best_success = result
 
+    # ---------------------------------------------
+    # SELECT BEST OPTIMIZATION
+    # ---------------------------------------------
+
     if best_success is not None:
+
         best_result = best_success
+
     elif best_any is not None:
-        best_result = best_any
+
         print(
             "Warning: no successful L-BFGS-B run; "
-            "using the start with smallest finite objective."
+            "best finite result retained for diagnostics."
         )
+
+        best_result = best_any
+
     else:
-        raise ValueError("No optimization result with a finite objective.")
+        raise ValueError(
+            "No optimization result with a finite objective."
+        )
 
     # ---------------------------------------------
     # HESSIAN + STANDARD ERRORS
@@ -428,8 +506,13 @@ def run_multistart(
     cov = np.linalg.pinv(Hess)
 
     var_diag = np.diag(cov)
+
     if np.any(var_diag < 0):
-        print("Warning: negative variance estimates on diagonal; SEs clipped at 0.")
+        print(
+            "Warning: negative variance estimates on diagonal; "
+            "SEs clipped at 0."
+        )
+
     se = np.sqrt(np.maximum(var_diag, 0.0))
 
     eigvals = np.linalg.eigvals(Hess)
@@ -444,7 +527,6 @@ def run_multistart(
 
         clean_name = name.lower()
 
-        # beta_sp500 -> bsp500_hat
         clean_name = clean_name.replace("beta_", "b")
 
         param_hats[f"{clean_name}_hat"] = best_result.x[i]
@@ -467,13 +549,19 @@ def run_multistart(
     # Convert to namespace object
     params = SimpleNamespace(**param_hats)
 
-
     # ---------------------------------------------
     # PRINT RESULTS
     # ---------------------------------------------
 
     print("Optimization success:",
           best_result.success)
+
+    print("Successful starts:",
+          sum(
+              r.success and np.isfinite(r.fun) and r.fun < 1e90
+              for r in all_results
+          ),
+          "/", n_starts)
 
     print("Log-likelihood:",
           -best_result.fun)
@@ -502,19 +590,28 @@ def run_multistart(
 
     n_obs = len(y) - 2
     n_params = len(param_names)
+
     theta_hat = best_result.x
+
     td_hat = _theta_dict(theta_hat, param_names)
+
     sigma_hat = td_hat["sigma"]
 
-    residuals = _compute_mar_residuals(theta_hat, y, X, param_names)
+    residuals = _compute_mar_residuals(
+        theta_hat, y, X, param_names
+    )
+
     loglik_model = -float(best_result.fun)
+
     y_eff = y[1:-1]
 
     r2_mar = None
     r2_marx = None
+
     diagnostics = {}
 
     if is_marx:
+
         r2_marx = _r_squared(residuals, y_eff)
 
         print("\n" + "=" * 60)
@@ -533,7 +630,9 @@ def run_multistart(
         )
 
     else:
+
         r2_mar = _r_squared(residuals, y_eff)
+
         print("\n" + "=" * 60)
         print("MLE diagnostics")
         print("=" * 60)
@@ -556,19 +655,30 @@ def run_multistart(
     return {
         "params": params,
         "result": best_result,
+        "success": best_success is not None,
         "se": se,
         "cov": cov,
         "Hessian": Hess,
         "eigenvalues": eigvals,
         "all_results": all_results,
+        "n_converged": sum(
+            r.success and np.isfinite(r.fun) and r.fun < 1e90
+            for r in all_results
+        ),
+        "n_starts": n_starts,
         "r2_mar": r2_mar,
         "r2_marx": r2_marx if is_marx else None,
-        "aic": diagnostics["marx"]["aic"] if is_marx else diagnostics["mar"]["aic"],
-        "bic": diagnostics["marx"]["bic"] if is_marx else diagnostics["mar"]["bic"],
+        "aic": (
+            diagnostics["marx"]["aic"]
+            if is_marx else diagnostics["mar"]["aic"]
+        ),
+        "bic": (
+            diagnostics["marx"]["bic"]
+            if is_marx else diagnostics["mar"]["bic"]
+        ),
         "residuals": residuals,
         "diagnostics": diagnostics,
     }
-
 
 
 
@@ -760,7 +870,7 @@ def plot_predictive_density_ax(
     peak_x_offsets = {peak: 0 for peak in peaks}
 
     overlap_threshold = 30  # Screen pixels
-    side_shift = 9           # Small shift in points
+    side_shift = 9       # Small shift in points
 
     # Current price position in screen coordinates
     current_x_screen = ax.transData.transform(
